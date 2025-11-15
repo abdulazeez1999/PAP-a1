@@ -56,8 +56,9 @@ unsigned long SequenceInfo::gpsa_taskloop(
     long G = std::max(1L, grain_size);
     int max_sum = (rows - 1) + (cols - 1);
 
-    #pragma omp parallel default(shared)
-    {
+    ##pragma omp parallel default(none) \
+        shared(S, X, Y, rows, cols, gap_penalty, match_score, mismatch_score, visited) \
+        firstprivate(G, max_sum)
         #pragma omp single
         {
             for (int sum = 2; sum <= max_sum; ++sum) {
@@ -126,7 +127,9 @@ unsigned long SequenceInfo::gpsa_tasks(
     std::vector<int> tokens(nX * nY, 0);
     int* tokens_ptr = tokens.data();   // IMPORTANT FOR DEPEND CLAUSES
 
-    #pragma omp parallel default(shared)
+    #pragma omp parallel default(none) \
+        shared(S, X, Y, rows, cols, gap_penalty, match_score, mismatch_score, tokens_ptr, tokens, visited) \
+        firstprivate(nX, nY, bx, by)
     {
         #pragma omp single
         {
