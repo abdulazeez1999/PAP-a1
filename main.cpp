@@ -8,7 +8,7 @@ int main(int argc, char **argv)
 {
     bool print_runtime_only = false;
     int exec_mode = 0; // 0. all, 1 sequential only, 2. taskloop only, 3. explicit tasks only
-    long grain_size = 1; // optional parameter to use for adjusting task granularity 
+    long grain_size = 0; // optional parameter to use for adjusting task granularity 
     int block_size_x = 1, block_size_y = 1; // optional parameter to use for adjusting task granularity with blocks
 	std::string X_filename = "X.txt", Y_filename = "Y.txt", output_filename = "aligned-sequential.txt";
 	

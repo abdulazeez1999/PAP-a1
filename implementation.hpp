@@ -5,12 +5,14 @@
 #include <omp.h>
 #include "helpers.hpp"
 
-// ------------------------------------------------------------
-// SEQUENTIAL VERSION
-// ------------------------------------------------------------
-unsigned long SequenceInfo::gpsa_sequential(float** S) {
+// =====================================================================
+//  SEQUENTIAL VERSION
+// =====================================================================
+unsigned long SequenceInfo::gpsa_sequential(float** S)
+{
     unsigned long visited = 0;
 
+    // boundaries
     for (unsigned int i = 1; i < rows; i++) {
         S[i][0] = i * gap_penalty;
         visited++;
@@ -20,12 +22,15 @@ unsigned long SequenceInfo::gpsa_sequential(float** S) {
         visited++;
     }
 
+    // DP
     for (unsigned int i = 1; i < rows; i++) {
         for (unsigned int j = 1; j < cols; j++) {
-            float match = S[i - 1][j - 1] +
-                ((X[i - 1] == Y[j - 1]) ? match_score : mismatch_score);
-            float del = S[i - 1][j] + gap_penalty;
-            float ins = S[i][j - 1] + gap_penalty;
+
+            float match = S[i-1][j-1] +
+                ((X[i-1] == Y[j-1]) ? match_score : mismatch_score);
+
+            float del = S[i-1][j] + gap_penalty;
+            float ins = S[i][j-1] + gap_penalty;
 
             S[i][j] = std::max(match, std::max(del, ins));
             visited++;
@@ -34,20 +39,20 @@ unsigned long SequenceInfo::gpsa_sequential(float** S) {
     return visited;
 }
 
-
-// ------------------------------------------------------------
-// TASKLOOP VERSION  (ANTI-DIAGONAL WAVEFRONT)
-// ------------------------------------------------------------
+// =====================================================================
+//  TASKLOOP VERSION (ANTI–DIAGONAL WAVEFRONT)
+// =====================================================================
 unsigned long SequenceInfo::gpsa_taskloop(
     float** S, long grain_size, int /*bx*/, int /*by*/)
 {
     unsigned long visited = 0;
 
-    for (unsigned int i = 1; i < rows; ++i) {
+    // boundaries
+    for (unsigned int i = 1; i < rows; i++) {
         S[i][0] = i * gap_penalty;
         visited++;
     }
-    for (unsigned int j = 0; j < cols; ++j) {
+    for (unsigned int j = 0; j < cols; j++) {
         S[0][j] = j * gap_penalty;
         visited++;
     }
@@ -56,28 +61,32 @@ unsigned long SequenceInfo::gpsa_taskloop(
     long G = std::max(1L, grain_size);
     int max_sum = (rows - 1) + (cols - 1);
 
-    ##pragma omp parallel default(none) \
-        shared(S, X, Y, rows, cols, gap_penalty, match_score, mismatch_score, visited) \
-        firstprivate(G, max_sum)
+    #pragma omp parallel
+    {
         #pragma omp single
         {
             for (int sum = 2; sum <= max_sum; ++sum) {
+
                 int i_min = std::max(1, sum - (int)(cols - 1));
                 int i_max = std::min((int)(rows - 1), sum - 1);
-                int len = i_max - i_min + 1;
+                int len   = i_max - i_min + 1;
+
                 if (len <= 0) continue;
 
-                #pragma omp taskloop grainsize(G)    \
-                    firstprivate(i_min, sum, len)   \
+                #pragma omp taskloop grainsize(G) \
+                    firstprivate(i_min, sum, len) \
+                    shared(S, X, Y, gap_penalty, match_score, mismatch_score) \
                     reduction(+:visited)
-                for (int t = 0; t < len; ++t) {
+                for (int t = 0; t < len; t++) {
+
                     int i = i_min + t;
                     int j = sum - i;
 
-                    float match = S[i - 1][j - 1] +
-                        ((X[i - 1] == Y[j - 1]) ? match_score : mismatch_score);
-                    float del = S[i - 1][j] + gap_penalty;
-                    float ins = S[i][j - 1] + gap_penalty;
+                    float match = S[i-1][j-1] +
+                        ((X[i-1] == Y[j-1]) ? match_score : mismatch_score);
+
+                    float del = S[i-1][j] + gap_penalty;
+                    float ins = S[i][j-1] + gap_penalty;
 
                     S[i][j] = std::max(match, std::max(del, ins));
                     visited++;
@@ -87,49 +96,65 @@ unsigned long SequenceInfo::gpsa_taskloop(
             }
         }
     }
-
     return visited;
 }
 
-
-// ------------------------------------------------------------
-// EXPLICIT TASKS VERSION  (TILED WAVEFRONT WITH DEPENDENCES)
-// ------------------------------------------------------------
+// =====================================================================
+//  EXPLICIT TASKS VERSION (TILED WAVEFRONT + DEPENDENCES)
+// =====================================================================
 unsigned long SequenceInfo::gpsa_tasks(
     float** S, long grain_size, int bx, int by)
 {
     unsigned long visited = 0;
 
-    for (unsigned int i = 1; i < rows; ++i) {
+    // boundaries
+    for (unsigned int i = 1; i < rows; i++) {
         S[i][0] = i * gap_penalty;
         visited++;
     }
-    for (unsigned int j = 0; j < cols; ++j) {
+    for (unsigned int j = 0; j < cols; j++) {
         S[0][j] = j * gap_penalty;
         visited++;
     }
     if (rows <= 1 || cols <= 1)
         return visited;
 
-    // determine block sizes (same as before)
-    long area = (grain_size > 0 ? grain_size : (long)bx * by);
-    if (grain_size > 0) {
-        int side = (int)std::sqrt((double)area);
-        bx = std::max(1, side);
+    // =====================================================
+    // CORRECT BLOCK SIZE LOGIC (assignment compliant)
+    // =====================================================
+
+    bool user_blocks = (bx > 1 || by > 1);    // user passed --block-size-x/y
+
+    if (!user_blocks && grain_size > 0) {
+        // derive block area from grain_size
+        long area = grain_size;
+        int side  = (int)std::sqrt((double)area);
+        if (side < 1) side = 1;
+
+        bx = side;
         by = std::max(1, (int)(area / bx));
     }
+    else if (!user_blocks) {
+        // neither block sizes nor grain size provided
+        bx = 256;
+        by = 256;
+    }
+    // else: user provided block sizes → keep bx,by unchanged
+
+    // clamp to matrix
     bx = std::max(1, std::min(bx, (int)cols - 1));
     by = std::max(1, std::min(by, (int)rows - 1));
 
-    int nY = ((int)rows - 1 + by - 1) / by;
-    int nX = ((int)cols - 1 + bx - 1) / bx;
+    int nY = ((rows - 1) + by - 1) / by;
+    int nX = ((cols - 1) + bx - 1) / bx;
 
     std::vector<int> tokens(nX * nY, 0);
-    int* tokens_ptr = tokens.data();   // IMPORTANT FOR DEPEND CLAUSES
+    int* tokens_ptr = tokens.data();
 
-    #pragma omp parallel default(none) \
-        shared(S, X, Y, rows, cols, gap_penalty, match_score, mismatch_score, tokens_ptr, tokens, visited) \
-        firstprivate(nX, nY, bx, by)
+    // =====================================================
+    // PARALLEL REGION
+    // =====================================================
+    #pragma omp parallel
     {
         #pragma omp single
         {
@@ -137,8 +162,8 @@ unsigned long SequenceInfo::gpsa_tasks(
             {
                 int max_wave = nX + nY - 2;
 
-                for (int wave = 0; wave <= max_wave; ++wave) {
-                    for (int ty = 0; ty < nY; ++ty) {
+                for (int wave = 0; wave <= max_wave; wave++) {
+                    for (int ty = 0; ty < nY; ty++) {
 
                         int tx = wave - ty;
                         if (tx < 0 || tx >= nX) continue;
@@ -149,93 +174,109 @@ unsigned long SequenceInfo::gpsa_tasks(
                         int j1 = std::min(j0 + bx - 1, (int)cols - 1);
 
                         int idx      = ty * nX + tx;
-                        int idx_up   = (ty > 0 ? (ty - 1) * nX + tx : -1);
-                        int idx_left = (tx > 0 ? ty * nX + (tx - 1) : -1);
+                        int idx_up   = (ty > 0 ? (ty - 1) * nX + tx     : -1);
+                        int idx_left = (tx > 0 ?  ty      * nX + tx - 1 : -1);
 
-                        // both dependencies exist
+                        // -------------------
+                        // with dependencies
+                        // -------------------
                         if (idx_up >= 0 && idx_left >= 0) {
 
-                            #pragma omp task firstprivate(i0,j0,i1,j1,idx,idx_up,idx_left) \
+                            #pragma omp task \
+                                firstprivate(i0,j0,i1,j1,idx,idx_up,idx_left) \
                                 depend(in:  tokens_ptr[idx_up], tokens_ptr[idx_left]) \
                                 depend(out: tokens_ptr[idx]) \
+                                shared(S, X, Y, gap_penalty, match_score, mismatch_score, tokens_ptr) \
                                 in_reduction(+:visited)
                             {
-                                unsigned long local=0;
-                                for (int i=i0;i<=i1;i++)
-                                    for (int j=j0;j<=j1;j++) {
-                                        float match=S[i-1][j-1] +
-                                          ((X[i-1]==Y[j-1])?match_score:mismatch_score);
-                                        float del=S[i-1][j]+gap_penalty;
-                                        float ins=S[i][j-1]+gap_penalty;
-                                        S[i][j]=std::max(match, std::max(del, ins));
+                                unsigned long local = 0;
+                                for (int i=i0; i<=i1; i++)
+                                    for (int j=j0; j<=j1; j++) {
+
+                                        float match = S[i-1][j-1] +
+                                          ((X[i-1]==Y[j-1])? match_score:mismatch_score);
+                                        float del  = S[i-1][j] + gap_penalty;
+                                        float ins  = S[i][j-1] + gap_penalty;
+
+                                        S[i][j] = std::max(match, std::max(del, ins));
                                         local++;
                                     }
                                 tokens_ptr[idx] = 1;
                                 visited += local;
                             }
                         }
-                        // only up dependency
                         else if (idx_up >= 0) {
 
-                            #pragma omp task firstprivate(i0,j0,i1,j1,idx,idx_up) \
+                            #pragma omp task \
+                                firstprivate(i0,j0,i1,j1,idx,idx_up) \
                                 depend(in:  tokens_ptr[idx_up]) \
                                 depend(out: tokens_ptr[idx]) \
+                                shared(S, X, Y, gap_penalty, match_score, mismatch_score, tokens_ptr) \
                                 in_reduction(+:visited)
                             {
-                                unsigned long local=0;
-                                for (int i=i0;i<=i1;i++)
-                                    for (int j=j0;j<=j1;j++) {
-                                        float match=S[i-1][j-1] +
-                                          ((X[i-1]==Y[j-1])?match_score:mismatch_score);
-                                        float del=S[i-1][j]+gap_penalty;
-                                        float ins=S[i][j-1]+gap_penalty;
-                                        S[i][j]=std::max(match, std::max(del, ins));
+                                unsigned long local = 0;
+                                for (int i=i0; i<=i1; i++)
+                                    for (int j=j0; j<=j1; j++) {
+
+                                        float match = S[i-1][j-1] +
+                                          ((X[i-1]==Y[j-1])? match_score:mismatch_score);
+                                        float del  = S[i-1][j] + gap_penalty;
+                                        float ins  = S[i][j-1] + gap_penalty;
+
+                                        S[i][j] = std::max(match, std::max(del, ins));
                                         local++;
                                     }
                                 tokens_ptr[idx] = 1;
                                 visited += local;
                             }
                         }
-                        // only left dependency
                         else if (idx_left >= 0) {
 
-                            #pragma omp task firstprivate(i0,j0,i1,j1,idx,idx_left) \
+                            #pragma omp task \
+                                firstprivate(i0,j0,i1,j1,idx,idx_left) \
                                 depend(in:  tokens_ptr[idx_left]) \
                                 depend(out: tokens_ptr[idx]) \
+                                shared(S, X, Y, gap_penalty, match_score, mismatch_score, tokens_ptr) \
                                 in_reduction(+:visited)
                             {
-                                unsigned long local=0;
-                                for (int i=i0;i<=i1;i++)
-                                    for (int j=j0;j<=j1;j++) {
-                                        float match=S[i-1][j-1] +
-                                          ((X[i-1]==Y[j-1])?match_score:mismatch_score);
-                                        float del=S[i-1][j]+gap_penalty;
-                                        float ins=S[i][j-1]+gap_penalty;
-                                        S[i][j]=std::max(match, std::max(del, ins));
+                                unsigned long local = 0;
+                                for (int i=i0; i<=i1; i++)
+                                    for (int j=j0; j<=j1; j++) {
+
+                                        float match = S[i-1][j-1] +
+                                          ((X[i-1]==Y[j-1])? match_score:mismatch_score);
+                                        float del  = S[i-1][j] + gap_penalty;
+                                        float ins  = S[i][j-1] + gap_penalty;
+
+                                        S[i][j] = std::max(match, std::max(del, ins));
                                         local++;
                                     }
-                                tokens_ptr[idx]=1;
+                                tokens_ptr[idx] = 1;
                                 visited += local;
                             }
                         }
-                        // no dependencies (top-left tile)
                         else {
+                            // top-left tile: no deps
 
-                            #pragma omp task firstprivate(i0,j0,i1,j1,idx) \
+                            #pragma omp task \
+                                firstprivate(i0,j0,i1,j1,idx) \
                                 depend(out: tokens_ptr[idx]) \
+                                shared(S, X, Y, gap_penalty, match_score, mismatch_score, tokens_ptr) \
                                 in_reduction(+:visited)
                             {
-                                unsigned long local=0;
-                                for (int i=i0;i<=i1;i++)
-                                    for (int j=j0;j<=j1;j++) {
-                                        float match=S[i-1][j-1] +
-                                          ((X[i-1]==Y[j-1])?match_score:mismatch_score);
-                                        float del=S[i-1][j]+gap_penalty;
-                                        float ins=S[i][j-1]+gap_penalty;
-                                        S[i][j]=std::max(match, std::max(del, ins));
+                                unsigned long local = 0;
+                                for (int i=i0; i<=i1; i++)
+                                    for (int j=j0; j<=j1; j++) {
+
+                                        float match = S[i-1][j-1] +
+                                          ((X[i-1]==Y[j-1])? match_score:mismatch_score);
+                                        float del  = S[i-1][j] + gap_penalty;
+                                        float ins  = S[i][j-1] + gap_penalty;
+
+                                        S[i][j] = std::max(match, std::max(del, ins));
                                         local++;
                                     }
-                                tokens_ptr[idx]=1;
+                                tokens_ptr[idx] = 1;
                                 visited += local;
                             }
                         }
@@ -247,4 +288,3 @@ unsigned long SequenceInfo::gpsa_tasks(
 
     return visited;
 }
-
